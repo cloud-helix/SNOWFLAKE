@@ -1,0 +1,501 @@
+CREATE OR REPLACE DATABASE EV_CHARGING_DATA;
+USE DATABASE EV_CHARGING_DATA;
+
+CREATE OR REPLACE SCHEMA RAW_LAYER;
+CREATE OR REPLACE SCHEMA VALIDATED_LAYER;
+CREATE OR REPLACE SCHEMA CURATED_LAYER;
+
+USE SCHEMA RAW_LAYER;
+show tables;
+
+desc table RAW_LAYER.users_raw;
+select * from RAW_LAYER.USERS_RAW;
+
+select vehicle_id,user_id, name from RAW_LAYER vehicles left join users on vehicles.user_id=users.user_id;
+
+
+CREATE OR REPLACE TABLE vehicles_raw (
+  vehicle_id STRING,
+  user_id STRING,
+  model STRING,
+  battery_capacity_kwh FLOAT,
+  vin STRING,
+  registration_number STRING
+);
+
+CREATE OR REPLACE TABLE users_raw (
+  user_id STRING,
+  name STRING,
+  dob DATE,
+  gender STRING,
+  phone STRING,
+  email STRING,
+  city STRING,
+  state STRING,
+  registration_date DATE,
+  kyc_status STRING,
+  is_fleet_user BOOLEAN,
+  corporate_id STRING
+);
+
+CREATE OR REPLACE TABLE sessions_raw (
+  session_id STRING,
+  user_id STRING,
+  vehicle_id STRING,
+  charger_id STRING,
+  start_time TIMESTAMP,
+  end_time TIMESTAMP,
+  energy_kwh FLOAT,
+  duration_sec NUMBER,
+  tariff_type STRING,
+  price FLOAT,
+  start_soc FLOAT,
+  end_soc FLOAT,
+  grid_meter_reading FLOAT,
+  payment_channel STRING,
+  is_flagged BOOLEAN
+);
+
+CREATE OR REPLACE TABLE stations_raw (
+  station_id STRING,
+  station_name STRING,
+  latitude FLOAT,
+  longitude FLOAT,
+  city STRING,
+  zone STRING,
+  capacity_kw FLOAT,
+  operator STRING,
+  status STRING,
+  install_date DATE
+);
+
+CREATE OR REPLACE TABLE chargers_raw (
+  charger_id STRING,
+  station_id STRING,
+  charger_type STRING,
+  max_kw FLOAT,
+  status STRING,
+  firmware_version STRING,
+  last_maintenance_date DATE,
+  error_code STRING
+);
+
+CREATE OR REPLACE STAGE ev_external_stage
+URL = 's3://swetha-lbrce/evdata/'
+CREDENTIALS = (
+   AWS_KEY_ID = 'AKIA22LT35TWWYUW54VZ'       -- AWS access key
+   AWS_SECRET_KEY = 'VKlKJySg505RDmZBUxtYtpWodpjftndBwoTxV+Mr'
+)
+FILE_FORMAT = (
+    TYPE = 'CSV',
+    FIELD_OPTIONALLY_ENCLOSED_BY = '"',
+    SKIP_HEADER = 1
+);
+
+LIST @ev_external_stage;
+
+COPY INTO stations_raw
+FROM @ev_external_stage/stations/
+FILE_FORMAT = (TYPE = 'CSV' SKIP_HEADER = 1);
+
+COPY INTO chargers_raw
+FROM @ev_external_stage/chargers/
+PATTERN = '.*chargers.*\\.csv'
+FILE_FORMAT = (TYPE = 'CSV' SKIP_HEADER = 1);
+
+COPY INTO sessions_raw
+FROM @ev_external_stage/sessions/
+FILE_FORMAT = (TYPE = 'CSV' SKIP_HEADER = 1);
+
+COPY INTO vehicles_raw
+FROM @ev_external_stage/vehicles/
+FILE_FORMAT = (TYPE = 'CSV' SKIP_HEADER = 1);
+
+COPY INTO users_raw
+FROM @ev_external_stage/users/
+FILE_FORMAT = (TYPE = 'CSV' SKIP_HEADER = 1);
+
+SELECT COUNT(*) FROM stations_raw;
+SELECT COUNT(*) FROM chargers_raw;
+SELECT COUNT(*) FROM sessions_raw;
+SELECT COUNT(*) FROM vehicles_raw;
+SELECT COUNT(*) FROM users_raw;
+
+USE SCHEMA VALIDATED_LAYER;
+
+-- ==========================================
+-- USE VALIDATED SCHEMA
+-- ==========================================
+USE DATABASE EV_CHARGING_DATA;
+USE SCHEMA VALIDATED_LAYER;
+
+-- ==========================================
+-- USE DATABASE & SCHEMA
+-- ==========================================
+USE DATABASE EV_CHARGING_DATA;  
+
+
+USE SCHEMA VALIDATED_LAYER;    
+
+
+CREATE OR REPLACE TABLE stations_validated AS
+SELECT *
+FROM RAW_LAYER.stations_raw
+WHERE station_id IS NOT NULL;
+
+
+
+
+-- ==========================================
+-- CHARGERS
+-- ==========================================
+CREATE OR REPLACE TABLE chargers_validated AS
+SELECT *
+FROM RAW_LAYER.chargers_raw
+WHERE charger_id IS NOT NULL
+  AND station_id IN (
+      SELECT station_id FROM stations_validated
+  );
+
+
+
+-- ==========================================
+-- USERS
+-- ==========================================
+CREATE OR REPLACE TABLE users_validated AS
+SELECT *
+FROM RAW_LAYER.users_raw
+WHERE user_id IS NOT NULL;
+
+
+
+
+-- ==========================================
+-- VEHICLES
+-- ==========================================
+CREATE OR REPLACE TABLE vehicles_validated AS
+SELECT *
+FROM RAW_LAYER.vehicles_raw
+WHERE vehicle_id IS NOT NULL
+  AND user_id IN (
+      SELECT user_id FROM users_validated
+  );
+
+-- ==========================================
+-- SESSIONS (IMPORTANT)
+-- ==========================================
+CREATE OR REPLACE TABLE sessions_validated AS
+SELECT *
+FROM RAW_LAYER.sessions_raw
+WHERE session_id IS NOT NULL
+  AND energy_kwh >= 0
+  AND duration_sec >= 0
+  AND start_soc BETWEEN 0 AND 100
+  AND end_soc BETWEEN 0 AND 100
+  AND end_time >= start_time
+  AND user_id IN (SELECT user_id FROM users_validated)
+  AND vehicle_id IN (SELECT vehicle_id FROM vehicles_validated)
+  AND charger_id IN (SELECT charger_id FROM chargers_validated);
+
+-- ==========================================
+-- QUICK DATA QUALITY CHECK
+-- ==========================================
+SELECT 'sessions_count' AS check_name, COUNT(*) FROM sessions_validated
+UNION ALL
+SELECT 'invalid_energy', COUNT(*) FROM RAW_LAYER.sessions_raw WHERE energy_kwh < 0
+UNION ALL
+SELECT 'invalid_soc', COUNT(*) FROM RAW_LAYER.sessions_raw
+WHERE start_soc NOT BETWEEN 0 AND 100 OR end_soc NOT BETWEEN 0 AND 100;
+
+SELECT
+  CONVERT_TIMEZONE('Asia/Kolkata','UTC', start_time) AS start_time,
+  CONVERT_TIMEZONE('Asia/Kolkata','UTC', end_time) AS end_time
+FROM RAW_LAYER.sessions_raw;
+
+SELECT 'invalid_fk_users', COUNT(*)
+FROM RAW_LAYER.sessions_raw
+WHERE user_id NOT IN (SELECT user_id FROM users_validated);
+
+SELECT 'invalid_user_fk' AS check_name, COUNT(*)
+FROM RAW_LAYER.sessions_raw
+WHERE user_id NOT IN (SELECT user_id FROM users_validated)
+
+UNION ALL
+
+SELECT 'invalid_vehicle_fk', COUNT(*)
+FROM RAW_LAYER.sessions_raw
+WHERE vehicle_id NOT IN (SELECT vehicle_id FROM vehicles_validated)
+
+UNION ALL
+
+SELECT 'invalid_charger_fk', COUNT(*)
+FROM RAW_LAYER.sessions_raw
+WHERE charger_id NOT IN (SELECT charger_id FROM chargers_validated)
+
+UNION ALL
+
+SELECT 'invalid_station_fk', COUNT(*)
+FROM RAW_LAYER.chargers_raw
+WHERE station_id NOT IN (SELECT station_id FROM stations_validated);
+
+CREATE OR REPLACE PROCEDURE detect_anomalies()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+
+-- ==========================================
+-- CREATE TABLE USING DYNAMIC SQL
+-- ==========================================
+EXECUTE IMMEDIATE '
+CREATE OR REPLACE TABLE anomalies AS
+SELECT
+    s.session_id,
+    s.user_id,
+    s.charger_id,
+
+    CASE
+        WHEN (s.end_soc - s.start_soc) > 30
+             AND s.duration_sec < 120
+        THEN ''SOC_JUMP''
+        ELSE NULL
+    END AS soc_issue,
+
+    CASE
+        WHEN s.energy_kwh > c.max_kw * (s.duration_sec/3600)
+        THEN ''ENERGY_MISMATCH''
+        ELSE NULL
+    END AS energy_issue,
+
+    CASE
+        WHEN s.duration_sec > 86400
+        THEN ''LONG_IDLE''
+        ELSE NULL
+    END AS idle_issue
+
+FROM VALIDATED_LAYER.sessions_validated s
+JOIN VALIDATED_LAYER.chargers_validated c
+ON s.charger_id = c.charger_id
+';
+
+-- ==========================================
+-- INSERT PARALLEL SESSION DATA
+-- ==========================================
+INSERT INTO anomalies
+SELECT
+    s1.session_id,
+    s1.user_id,
+    s1.charger_id,
+    'PARALLEL_SESSION',
+    NULL,
+    NULL
+FROM VALIDATED_LAYER.sessions_validated s1
+JOIN VALIDATED_LAYER.sessions_validated s2
+ON s1.user_id = s2.user_id
+AND s1.session_id <> s2.session_id
+AND s1.start_time < s2.end_time
+AND s1.end_time > s2.start_time;
+
+-- ==========================================
+-- RETURN MESSAGE
+-- ==========================================
+RETURN 'Anomaly detection completed';
+
+END;
+$$;
+
+CALL detect_anomalies();
+
+USE ROLE ACCOUNTADMIN;
+USE DATABASE EV_CHARGING_DATA;
+
+ALTER TABLE VALIDATED_LAYER.users_validated
+MODIFY COLUMN email UNSET MASKING POLICY;
+
+CREATE OR REPLACE MASKING POLICY email_mask
+AS (val STRING)
+RETURNS STRING ->
+CASE
+    WHEN CURRENT_ROLE() = 'ADMIN_ROLE' THEN val
+    ELSE '*****@masked.com'
+END;
+
+ALTER TABLE VALIDATED_LAYER.users_validated
+MODIFY COLUMN email SET MASKING POLICY email_mask;
+
+REVOKE ROLE ADMIN_ROLE FROM ROLE ANALYST_ROLE;
+
+GRANT ROLE ADMIN_ROLE TO USER EARLARAJASWETHA1287;
+GRANT ROLE ANALYST_ROLE TO USER EARLARAJASWETHA1287;
+
+USE ROLE ANALYST_ROLE;
+
+SELECT CURRENT_ROLE();
+SELECT email FROM VALIDATED_LAYER.users_validated;
+
+USE ROLE ADMIN_ROLE;
+SELECT email FROM VALIDATED_LAYER.users_validated;
+
+-- ==========================================
+-- STEP 1: USE ACCOUNTADMIN
+-- ==========================================
+USE ROLE ACCOUNTADMIN;
+USE DATABASE EV_CHARGING_DATA;
+
+-- ==========================================
+-- STEP 2: CREATE ROLES
+-- ==========================================
+CREATE OR REPLACE ROLE ANALYST_EAST;
+CREATE OR REPLACE ROLE ANALYST_SOUTH;
+
+-- ==========================================
+-- STEP 3: GRANT ROLES TO USER
+-- ==========================================
+GRANT ROLE ANALYST_EAST TO USER EARLARAJASWETHA1287;
+GRANT ROLE ANALYST_SOUTH TO USER EARLARAJASWETHA1287;
+
+-- ==========================================
+-- STEP 4: GRANT ACCESS
+-- ==========================================
+GRANT USAGE ON DATABASE EV_CHARGING_DATA TO ROLE ANALYST_EAST;
+GRANT USAGE ON SCHEMA VALIDATED_LAYER TO ROLE ANALYST_EAST;
+GRANT SELECT ON ALL TABLES IN SCHEMA VALIDATED_LAYER TO ROLE ANALYST_EAST;
+
+GRANT USAGE ON DATABASE EV_CHARGING_DATA TO ROLE ANALYST_SOUTH;
+GRANT USAGE ON SCHEMA VALIDATED_LAYER TO ROLE ANALYST_SOUTH;
+GRANT SELECT ON ALL TABLES IN SCHEMA VALIDATED_LAYER TO ROLE ANALYST_SOUTH;
+
+-- ==========================================
+-- STEP 5: CREATE ROW ACCESS POLICY
+-- ==========================================
+CREATE OR REPLACE ROW ACCESS POLICY region_policy
+AS (city STRING)
+RETURNS BOOLEAN ->
+CASE
+    WHEN CURRENT_ROLE() = 'ACCOUNTADMIN' THEN TRUE
+    WHEN CURRENT_ROLE() = 'ANALYST_EAST' AND city = 'Vijayawada' THEN TRUE
+    WHEN CURRENT_ROLE() = 'ANALYST_SOUTH' AND city = 'Hyderabad' THEN TRUE
+    ELSE FALSE
+END;
+
+-- ==========================================
+-- STEP 6: APPLY POLICY
+-- ==========================================
+ALTER TABLE VALIDATED_LAYER.stations_validated
+ADD ROW ACCESS POLICY region_policy ON (city);
+
+USE ROLE ANALYST_EAST;
+SELECT station_id, city
+FROM VALIDATED_LAYER.stations_validated;
+
+USE ROLE ACCOUNTADMIN;
+SELECT station_id, city
+FROM VALIDATED_LAYER.stations_validated;
+
+
+
+CREATE OR REPLACE TABLE CURATED_LAYER.audit_log (
+    batch_time TIMESTAMP,
+    total_sessions NUMBER,
+    anomaly_sessions NUMBER,
+    uptime_percentage FLOAT,
+    dq_violations NUMBER,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+);
+
+INSERT INTO CURATED_LAYER.audit_log (
+    batch_time,
+    total_sessions,
+    anomaly_sessions,
+    uptime_percentage,
+    dq_violations
+)
+SELECT
+    CURRENT_TIMESTAMP(),
+    COUNT(*),
+    SUM(CASE WHEN is_flagged THEN 1 ELSE 0 END),
+    ROUND(
+        (SUM(CASE WHEN duration_sec > 0 THEN 1 ELSE 0 END) * 100.0)
+        / COUNT(*), 2
+    ),
+    SUM(
+        CASE
+            WHEN energy_kwh < 0
+              OR duration_sec < 0
+              OR start_soc NOT BETWEEN 0 AND 100
+              OR end_soc NOT BETWEEN 0 AND 100
+            THEN 1 ELSE 0
+        END
+    )
+FROM VALIDATED_LAYER.sessions_validated;
+
+SELECT *
+FROM CURATED_LAYER.audit_log
+ORDER BY created_at DESC;
+
+
+CREATE OR REPLACE TABLE CURATED_LAYER.kpi_summary AS
+SELECT
+    COUNT(*) AS total_sessions,
+
+    SUM(CASE WHEN is_flagged THEN 1 ELSE 0 END) AS anomaly_sessions,
+
+    ROUND(
+        (SUM(CASE WHEN duration_sec > 0 THEN 1 ELSE 0 END) * 100.0)
+        / COUNT(*), 2
+    ) AS uptime_percentage,
+
+    SUM(
+        CASE
+            WHEN energy_kwh < 0
+              OR duration_sec < 0
+              OR start_soc NOT BETWEEN 0 AND 100
+              OR end_soc NOT BETWEEN 0 AND 100
+            THEN 1 ELSE 0
+        END
+    ) AS dq_violations
+
+FROM VALIDATED_LAYER.sessions_validated;
+
+// active user charging ratiio
+CREATE OR REPLACE TABLE CURATED_LAYER.active_users_kpi AS
+SELECT
+    ROUND(
+        (COUNT(DISTINCT user_id) * 100.0) /
+        (SELECT COUNT(DISTINCT user_id) FROM VALIDATED_LAYER.users_validated),
+    2) AS active_user_ratio
+FROM VALIDATED_LAYER.sessions_validated
+WHERE start_time >= DATEADD(DAY, -30, CURRENT_DATE());
+
+//Grid load distribution index
+
+CREATE OR REPLACE TABLE CURATED_LAYER.grid_load_kpi AS
+SELECT
+    ROUND(
+        (SUM(CASE WHEN total_energy < 500 THEN 1 ELSE 0 END) * 100.0)
+        / COUNT(*), 2
+    ) AS grid_load_index
+FROM (
+    SELECT
+        c.station_id,
+        SUM(s.energy_kwh) AS total_energy
+    FROM VALIDATED_LAYER.sessions_validated s
+    JOIN VALIDATED_LAYER.chargers_validated c
+    ON s.charger_id = c.charger_id
+    GROUP BY c.station_id
+);
+
+CREATE OR REPLACE TABLE CURATED_LAYER.avg_session_kpi AS
+SELECT
+    ROUND(AVG(duration_sec)/60, 2) AS avg_session_minutes
+FROM VALIDATED_LAYER.sessions_validated;
+
+//Average revenue per session
+
+CREATE OR REPLACE TABLE CURATED_LAYER.anomaly_summary AS
+SELECT
+    COALESCE(soc_issue, energy_issue, idle_issue) AS anomaly_type,
+    COUNT(*) AS total
+FROM anomalies
+GROUP BY anomaly_type;
